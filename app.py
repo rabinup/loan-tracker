@@ -1,94 +1,139 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 import pandas as pd
+import sqlite3
 from datetime import datetime
+import os
 
-st.set_page_config(page_title="Cloud Loan Ledger", layout="wide")
-st.title("🏦 My Final Loan Tracker")
+# --- DATABASE SETUP ---
+DB_FILE = 'loan_data.db'
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS loans 
+                 (name TEXT, principal REAL, rate REAL, start_date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS payments 
+                 (loan_name TEXT, amount REAL, date TEXT)''')
+    conn.commit()
+    conn.close()
 
-def load_data():
-    try:
-        l_df = conn.read(worksheet="loans", ttl="0s")
-        p_df = conn.read(worksheet="payments", ttl="0s")
-        return l_df.dropna(how='all'), p_df.dropna(how='all')
-    except:
-        return pd.DataFrame(columns=['name', 'principal', 'rate', 'start_date']), pd.DataFrame(columns=['loan_name', 'amount', 'date'])
+init_db()
 
-loans_df, payments_df = load_data()
+# --- APP CONFIG ---
+st.set_page_config(page_title="Personal Loan Tracker", layout="wide")
+st.title("🏦 Personal Loan Ledger (Offline + Backup)")
 
-# --- SIDEBAR ---
-st.sidebar.header("➕ Setup")
-n_name = st.sidebar.text_input("Loan Source")
-n_p = st.sidebar.number_input("Principal", min_value=0.0)
-n_r = st.sidebar.number_input("Rate (%)", value=2.0)
-n_d = st.sidebar.date_input("Start Date")
+# --- FUNCTIONS ---
+def add_loan(name, p, r, d):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO loans VALUES (?,?,?,?)", (name, p, r, str(d)))
+    conn.commit()
+    conn.close()
 
-if st.sidebar.button("Save to Cloud"):
-    if n_name:
-        new_row = pd.DataFrame([{"name": n_name, "principal": n_p, "rate": n_r, "start_date": str(n_d)}])
-        updated_loans = pd.concat([loans_df, new_row], ignore_index=True)
-        conn.update(worksheet="loans", data=updated_loans)
-        st.sidebar.success("Done!")
-        st.rerun()
+def add_payment(l_name, amt, dt):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO payments VALUES (?,?,?)", (l_name, amt, str(dt)))
+    conn.commit()
+    conn.close()
 
-# --- TABS ---
-tab1, tab2 = st.tabs(["📊 Portfolio & Payments", "🧮 Live Interest Meter"])
+def get_loans():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM loans", conn)
+    conn.close()
+    return df
+
+def get_payments():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM payments", conn)
+    conn.close()
+    return df
+
+# --- SIDEBAR: BACKUP & RESTORE ---
+st.sidebar.header("⚙️ Backup & Recovery")
+# Download Button
+if st.sidebar.button("Prepare Backup File"):
+    loans = get_loans()
+    payments = get_payments()
+    with pd.ExcelWriter("loan_backup.xlsx") as writer:
+        loans.to_excel(writer, sheet_name="loans", index=False)
+        payments.to_excel(writer, sheet_name="payments", index=False)
+    
+    with open("loan_backup.xlsx", "rb") as f:
+        st.sidebar.download_button("📥 Download Excel Backup", f, file_name="loan_backup.xlsx")
+
+# Restore (Upload) Button
+uploaded_file = st.sidebar.file_uploader("📂 Restore from Backup", type="xlsx")
+if uploaded_file and st.sidebar.button("Restore Now"):
+    l_up = pd.read_excel(uploaded_file, sheet_name="loans")
+    p_up = pd.read_excel(uploaded_file, sheet_name="payments")
+    conn = sqlite3.connect(DB_FILE)
+    l_up.to_sql("loans", conn, if_exists="replace", index=False)
+    p_up.to_sql("payments", conn, if_exists="replace", index=False)
+    conn.close()
+    st.sidebar.success("Data Restored!")
+    st.rerun()
+
+# --- MAIN UI ---
+tab1, tab2, tab3 = st.tabs(["➕ Add New", "💸 Payments", "📊 Reports"])
 
 with tab1:
-    if not loans_df.empty:
-        st.subheader("Your Loans")
-        st.dataframe(loans_df, use_container_width=True)
-        
-        st.divider()
-        st.subheader("Add Payment")
-        c1, c2 = st.columns(2)
-        with c1:
-            sel_l = st.selectbox("Select Loan", loans_df['name'].tolist())
-            amt = st.number_input("Amount Paid", min_value=0.0)
-        with c2:
-            dt = st.date_input("Payment Date")
-            if st.button("Submit Payment"):
-                new_p = pd.DataFrame([{"loan_name": sel_l, "amount": amt, "date": str(dt)}])
-                updated_p = pd.concat([payments_df, new_p], ignore_index=True)
-                conn.update(worksheet="payments", data=updated_p)
-                st.success("Payment Synced!")
-                st.rerun()
-    else:
-        st.info("No data yet.")
+    st.subheader("Add New Loan")
+    col1, col2 = st.columns(2)
+    with col1:
+        name = st.text_input("Name (e.g. Sujata)")
+        principal = st.number_input("Principal Amount", min_value=0.0)
+    with col2:
+        rate = st.number_input("Monthly Interest (%)", value=2.0)
+        date = st.date_input("Start Date", value=datetime.now())
+    
+    if st.button("Save Loan"):
+        if name:
+            add_loan(name, principal, rate, date)
+            st.success(f"Loan for {name} saved!")
+            st.rerun()
 
 with tab2:
+    st.subheader("Record Payment")
+    loans_df = get_loans()
     if not loans_df.empty:
-        target = st.selectbox("Check Live Interest", loans_df['name'].tolist())
-        
-        # Calculation Logic
-        l_info = loans_df[loans_df['name'] == target].iloc[0]
-        p_info = payments_df[payments_df['loan_name'] == target]
-        
-        sawa = float(l_info['principal'])
-        rate = float(l_info['rate'])
-        start_dt = datetime.strptime(str(l_info['start_date']), '%Y-%m-%d').date()
-        today = datetime.now().date()
-        
-        daily_rate = (rate / 100) / 30
-        current_sawa = sawa
-        total_int = 0
-        last_date = start_dt
-        
-        # Calculate through payments
-        for _, row in p_info.sort_values('date').iterrows():
-            curr_p_date = datetime.strptime(str(row['date']), '%Y-%m-%d').date()
-            days = (curr_p_date - last_date).days
-            total_int += current_sawa * daily_rate * max(0, days)
-            current_sawa -= float(row['amount'])
-            last_date = curr_p_date
+        l_list = loans_df['name'].tolist()
+        sel_loan = st.selectbox("Select Person", l_list)
+        p_amt = st.number_input("Payment Amount", min_value=0.0)
+        p_date = st.date_input("Payment Date")
+        if st.button("Save Payment"):
+            add_payment(sel_loan, p_amt, p_date)
+            st.success("Payment recorded!")
+            st.rerun()
+    else:
+        st.info("Paila Loan thapnu hola.")
+
+with tab3:
+    st.subheader("Live Balance Status")
+    loans_df = get_loans()
+    pay_df = get_payments()
+    
+    if not loans_df.empty:
+        for index, row in loans_df.iterrows():
+            # Interest Calculation Logic
+            sawa = row['principal']
+            r = row['rate']
+            start_dt = datetime.strptime(row['start_date'], '%Y-%m-%d').date()
             
-        # Till Today
-        days_today = (today - last_date).days
-        total_int += current_sawa * daily_rate * max(0, days_today)
-        
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Baki Sawa", f"Rs. {current_sawa:,.2f}")
-        m2.metric("Interest Till Today", f"Rs. {total_int:,.2f}")
-        m3.metric("Total Payable", f"Rs. {current_sawa + total_int:,.2f}")
+            # Filter payments for this person
+            person_pays = pay_df[pay_df['loan_name'] == row['name']]
+            
+            # Simple Interest Calculation till today
+            days = (datetime.now().date() - start_dt).days
+            total_interest = (sawa * (r/100) / 30) * days
+            total_paid = person_pays['amount'].sum()
+            total_due = (sawa + total_interest) - total_paid
+            
+            with st.expander(f"👤 {row['name']} Details"):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Principal", f"Rs. {sawa:,.0f}")
+                c2.metric("Total Interest", f"Rs. {total_interest:,.0f}")
+                c3.metric("Baki Amount", f"Rs. {total_due:,.0f}")
+                st.write("**Payment History:**")
+                st.dataframe(person_pays, use_container_width=True)
