@@ -46,7 +46,9 @@ def get_loans():
 
 def get_payments():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * col FROM payments", conn) # Small fix
+    df = pd.read_sql_query("SELECT * FROM payments", conn)
+    conn.close()
+    return df
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT * FROM payments", conn)
     conn.close()
